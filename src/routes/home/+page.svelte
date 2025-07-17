@@ -6,7 +6,6 @@
   // Corrected import path for MapLibre GL CSS
   import 'maplibre-gl/dist/maplibre-gl.css';
 
-  // State variables
   let user = null;
   let pickup = '';
   let destination = '';
@@ -14,11 +13,22 @@
   let suggestionsDestination = [];
   let pickupCoord = null;
   let destinationCoord = null;
-  let routeInfo = null;
+let routeInfo = null;
+let showRoutePanel = false;
   let map;
   let currentLocation = null;
   let isSearchingDriver = false; // New state for driver search loading
   let driverFoundMessage = ''; // New state for driver search message
+
+    /**
+     * @type {maplibregl.Marker | null}
+     */
+let pickupMarker = null; // Marker untuk lokasi pickup
+
+    /**
+     * @type {maplibregl.Marker | null}
+     */
+let destinationMarker = null; // Marker untuk lokasi destinasi
 
   const TARIF_PER_KM = 2000; // Tariff per kilometer
 
@@ -37,6 +47,18 @@
       pickup = data.display_name;
       pickupCoord = [lon, lat];
       driverFoundMessage = ''; // Clear any previous messages
+
+      // Hapus marker sebelumnya jika ada
+      if (pickupMarker) {
+        pickupMarker.remove();
+      }
+      // Tambahkan marker baru di lokasi pickup
+      if (map) {
+        pickupMarker = new maplibregl.Marker({ color: '#007bff' })
+          .setLngLat([lon, lat])
+          .addTo(map);
+        map.flyTo({ center: [lon, lat], zoom: map.getZoom() });
+      }
     } catch (error) {
       console.error("Error fetching current location address:", error);
       driverFoundMessage = 'Gagal mendapatkan alamat dari lokasi saat ini.';
@@ -54,7 +76,7 @@
     user = session.user;
 
     // Get current geolocation
-    navigator.geolocation.getCurrentPosition(pos => {
+    navigator.geolocation.getCurrentPosition(async pos => {
       currentLocation = [pos.coords.longitude, pos.coords.latitude];
       // Initialize MapLibre GL map
       map = new maplibregl.Map({
@@ -65,6 +87,33 @@
       });
       // Add navigation controls to the map
       map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+      // Set pickup default ke lokasi sekarang (reverse geocode)
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`);
+        const data = await res.json();
+        pickup = data.display_name;
+        pickupCoord = [pos.coords.longitude, pos.coords.latitude];
+        // Tambahkan marker pickup
+        if (pickupMarker) pickupMarker.remove();
+        pickupMarker = new maplibregl.Marker({ color: '#007bff' })
+          .setLngLat([pos.coords.longitude, pos.coords.latitude])
+          .addTo(map);
+      } catch (e) {
+        // fallback: kosongkan pickup
+        pickup = '';
+        pickupCoord = null;
+      }
+      // Hapus marker destinasi sebelumnya jika ada
+      if (destinationMarker) {
+        destinationMarker.remove();
+      }
+      // Tambahkan marker baru di lokasi destinasi
+      if (map && destinationCoord) {
+        destinationMarker = new maplibregl.Marker({ color: '#28a745' })
+          .setLngLat(destinationCoord)
+          .addTo(map);
+      }
     }, err => {
       // Alert user if geolocation is not enabled
       driverFoundMessage = "Aktifkan lokasi/GPS untuk menggunakan aplikasi.";
@@ -102,6 +151,14 @@
       pickup = item.display_name;
       pickupCoord = [parseFloat(item.lon), parseFloat(item.lat)];
       suggestionsPickup = []; // Clear suggestions after selection
+      // Update pickup marker
+      if (pickupMarker) pickupMarker.remove();
+      if (map && pickupCoord) {
+        pickupMarker = new maplibregl.Marker({ color: '#007bff' })
+          .setLngLat(pickupCoord)
+          .addTo(map);
+        map.flyTo({ center: pickupCoord, zoom: map.getZoom() });
+      }
     } else {
       destination = item.display_name;
       destinationCoord = [parseFloat(item.lon), parseFloat(item.lat)];
@@ -110,74 +167,71 @@
   };
 
   // Function to find route using OSRM
-  const cariRute = async () => {
-    if (!pickupCoord || !destinationCoord) {
-      driverFoundMessage = 'Mohon lengkapi lokasi penjemputan dan tujuan.';
-      return;
-    }
-    driverFoundMessage = ''; // Clear previous messages
-    isSearchingDriver = false; // Reset driver search state
+const cariRute = async () => {
+  if (!pickupCoord || !destinationCoord) {
+    driverFoundMessage = 'Mohon lengkapi lokasi penjemputan dan tujuan.';
+    return;
+  }
+  driverFoundMessage = '';
+  isSearchingDriver = false;
 
-    const url = `https://router.project-osrm.org/route/v1/driving/${pickupCoord.join(',')};${destinationCoord.join(',')}?overview=full&geometries=geojson`;
-    try {
-      const res = await fetch(url);
-      const data = await res.json();
+  const url = `https://router.project-osrm.org/route/v1/driving/${pickupCoord.join(',')};${destinationCoord.join(',')}?overview=full&geometries=geojson`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
 
-      if (data.routes && data.routes.length > 0) {
-        const route = data.routes[0];
-        const coords = route.geometry.coordinates; // Array of [lng, lat] pairs
-
-        // --- Perbaikan di sini: Menggunakan LngLatBounds untuk fitBounds ---
-        const bounds = new maplibregl.LngLatBounds();
-        for (const coord of coords) {
-            bounds.extend(coord);
-        }
-        // --- Akhir Perbaikan ---
-
-        // Remove existing route layer if any
-        if (map.getSource('route')) {
-          map.removeLayer('route');
-          map.removeSource('route');
-        }
-
-        // Add new route source and layer to the map
-        map.addSource('route', {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: { type: 'LineString', coordinates: coords }
-          }
-        });
-
-        map.addLayer({
-          id: 'route',
-          type: 'line',
-          source: 'route',
-          layout: { 'line-join': 'round', 'line-cap': 'round' },
-          paint: { 'line-color': '#ff0000', 'line-width': 4 }
-        });
-
-        // Fit map bounds to show the entire route using the calculated bounds
-        map.fitBounds(bounds, { padding: 40 });
-
-        // Calculate distance, duration, and tariff
-        const jarakKm = route.distance / 1000;
-        const waktu = Math.round(route.duration / 60);
-        routeInfo = {
-          distance: `${jarakKm.toFixed(2)} km`,
-          duration: `${waktu} menit`,
-          tarif: `Rp ${(jarakKm * TARIF_PER_KM).toLocaleString('id-ID')}` // Format tariff for Indonesian locale
-        };
-      } else {
-        routeInfo = null;
-        driverFoundMessage = 'Tidak dapat menemukan rute. Coba lokasi lain.';
+    if (data.routes && data.routes.length > 0) {
+      const route = data.routes[0];
+      const coords = route.geometry.coordinates;
+      const bounds = new maplibregl.LngLatBounds();
+      for (const coord of coords) bounds.extend(coord);
+      if (map.getSource('route')) {
+        map.removeLayer('route');
+        map.removeSource('route');
       }
-    } catch (error) {
-      console.error("Error finding route:", error);
+      map.addSource('route', {
+        type: 'geojson',
+        data: {
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: coords }
+        }
+      });
+      map.addLayer({
+        id: 'route',
+        type: 'line',
+        source: 'route',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': '#ff0000', 'line-width': 4 }
+      });
+      map.fitBounds(bounds, { padding: 40 });
+      if (destinationMarker) destinationMarker.remove();
+      if (map && destinationCoord) {
+        destinationMarker = new maplibregl.Marker({ color: '#28a745' })
+          .setLngLat(destinationCoord)
+          .addTo(map);
+      }
+      const jarakKm = route.distance / 1000;
+      const waktu = Math.round(route.duration / 60);
+      routeInfo = {
+        distance: `${jarakKm.toFixed(2)} km`,
+        duration: `${waktu} menit`,
+        tarif: `Rp ${(jarakKm * TARIF_PER_KM).toLocaleString('id-ID', { minimumFractionDigits: 0, maximumFractionDigits: 1 })}`
+      };
+      showRoutePanel = true;
+    } else {
       routeInfo = null;
-      driverFoundMessage = 'Terjadi kesalahan saat mencari rute.';
+      driverFoundMessage = 'Tidak dapat menemukan rute. Coba lokasi lain.';
     }
-  };
+  } catch (error) {
+    console.error("Error finding route:", error);
+    routeInfo = null;
+    driverFoundMessage = 'Terjadi kesalahan saat mencari rute.';
+  }
+};
+
+function backToForm() {
+  showRoutePanel = false;
+}
 
   // New function to simulate finding a driver
 const cariDriver = async () => {
@@ -226,57 +280,79 @@ const cariDriver = async () => {
 <style>
   /* Basic styling for the container */
   .home-container {
-    padding: 1rem;
-    font-family: 'Inter', sans-serif; /* Using Inter font */
-    max-width: 600px;
-    margin: 0 auto;
-    background-color: #f8f9fa;
+    font-family: 'Inter', 'Roboto', sans-serif;
+    width: 100vw;
+    height: 100vh;
+    margin: 0;
+    background: #f8f9fa;
     min-height: 100vh;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
   }
   /* Header styling */
   .header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 1.5rem;
-    padding: 10px 0;
+    padding: 0.7rem 1rem 0.7rem 1rem;
+    background: #f8f9fa;
     border-bottom: 1px solid #e2e8f0;
+    z-index: 10;
   }
   .header strong {
-    color: #343a40;
-    font-size: 1.1rem;
+    color: #222;
+    font-size: 1rem;
+    font-weight: 500;
+    letter-spacing: 0.2px;
   }
   /* Map placeholder styling */
   .map-placeholder {
-    height: 300px;
-    background-color: #e9ecef;
+    flex: 1;
+    width: 100vw;
+    height: 100%;
+    background: #e9ecef;
     display: flex;
     justify-content: center;
     align-items: center;
-    border-radius: 8px;
-    margin-bottom: 1.5rem;
-    overflow: hidden; /* Ensure map content stays within rounded corners */
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    margin: 0;
+    overflow: hidden;
+    position: relative;
+    z-index: 1;
   }
   .map-placeholder p {
     color: #6c757d;
   }
   /* Form input styling */
+  .order-form {
+    width: 100vw;
+    max-width: 400px;
+    margin: 0 auto;
+    background: #f8f9fa;
+    padding: 0.7rem 0.5rem 0.5rem 0.5rem;
+    position: relative;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    overflow-y: visible;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+  }
   .order-form input {
     width: 100%;
-    padding: 12px;
-    margin-bottom: 1rem;
-    font-size: 1rem;
-    border: 1px solid #ced4da;
-    border-radius: 8px; /* Rounded corners */
-    box-sizing: border-box; /* Include padding in width */
-    transition: border-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+    padding: 10px 10px;
+    margin-bottom: 0.5rem;
+    font-size: 0.95rem;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    background: #fff;
+    transition: border-color 0.2s;
+    box-sizing: border-box;
   }
   .order-form input:focus {
     border-color: #007bff;
-    box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
     outline: none;
   }
   /* Button styling */
@@ -286,96 +362,103 @@ const cariDriver = async () => {
     margin-bottom: 1rem;
   }
   .order-button, .cari-driver-button, .gunakan-lokasi-button {
-    flex: 1; /* Make buttons take equal width */
-    padding: 15px;
-    font-size: 1.1rem;
-    color: white;
+    width: 100%;
+    padding: 10px 0;
+    font-size: 0.95rem;
+    color: #fff;
     border: none;
-    border-radius: 8px; /* Rounded corners */
+    border-radius: 4px;
     cursor: pointer;
-    transition: background-color 0.2s ease-in-out, transform 0.1s ease-in-out;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    background: #007bff;
+    font-weight: 400;
+    margin-bottom: 0.5rem;
+    box-shadow: none;
+    transition: background 0.2s;
   }
   .order-button {
-    background-color: #007bff; /* Primary blue */
+    background: #007bff;
   }
   .order-button:hover {
-    background-color: #0056b3;
-    transform: translateY(-1px);
+    background: #0056b3;
   }
   .cari-driver-button {
-    background-color: #28a745; /* Success green */
+    background: #28a745;
   }
   .cari-driver-button:hover {
-    background-color: #218838;
-    transform: translateY(-1px);
+    background: #218838;
   }
   .cari-driver-button:disabled {
-    background-color: #6c757d; /* Grey when disabled */
+    background: #adb5bd;
     cursor: not-allowed;
   }
   .gunakan-lokasi-button {
-    background-color: #6c757d; /* Secondary grey */
-    padding: 10px 15px; /* Smaller padding for this button */
-    font-size: 1rem;
-    margin-bottom: 1rem; /* Add margin below it */
+    background: #6c757d;
+    font-size: 0.95rem;
+    margin-bottom: 0.5rem;
+    border:color(from color srgb r g b);
   }
   .gunakan-lokasi-button:hover {
-    background-color: #5a6268;
-    transform: translateY(-1px);
+    background: #5a6268;
   }
   .logout-button {
-    background-color: #dc3545; /* Danger red */
-    color: white;
+    background: transparent;
+    color: #dc3545;
     border: none;
-    padding: 8px 12px;
-    border-radius: 8px; /* Rounded corners */
+    padding: 0.3rem 0.7rem;
+    border-radius: 4px;
     cursor: pointer;
-    transition: background-color 0.2s ease-in-out;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    font-weight: 500;
+    font-size: 0.95rem;
+    transition: background 0.2s;
   }
   .logout-button:hover {
-    background-color: #c82333;
+    background: #f8d7da;
   }
   /* Suggestions dropdown styling */
   .suggestions {
-    background: white;
-    border: 1px solid #ced4da;
-    border-radius: 8px; /* Rounded corners */
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
     position: absolute;
-    z-index: 99;
-    max-height: 180px; /* Increased max-height for more suggestions */
+    left: 0;
+    right: 0;
+    top: 100%;
+    z-index: 999;
+    max-height: 180px;
     overflow-y: auto;
-    width: calc(100% - 2rem); /* Adjust width to match input, considering padding */
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    margin-top: -0.5rem; /* Adjust to overlap slightly with input */
+    width: 100%;
+    box-shadow: none;
+    margin-top: 2px;
   }
   .suggestions div {
-    padding: 12px;
+    padding: 10px 10px;
     cursor: pointer;
     border-bottom: 1px solid #f2f2f2;
     font-size: 0.95rem;
-    color: #343a40;
+    color: #222;
+    transition: background 0.15s;
   }
   .suggestions div:last-child {
     border-bottom: none;
   }
   .suggestions div:hover {
-    background-color: #e9ecef;
+    background: #f1f3f4;
   }
   /* Route info styling */
   .route-info {
-    background-color: #e9f7ef; /* Light green background */
-    padding: 1.5rem;
-    border-radius: 8px;
-    margin-top: 1.5rem;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    border: 1px solid #d4edda;
+    background: #f8f9fa;
+    padding: 0.7rem 0.5rem;
+    border-radius: 4px;
+    box-shadow: none;
+    border: none;
+    font-size: 0.95rem;
+    font-weight: 400;
+    color: #222;
   }
   .route-info p {
-    margin-bottom: 0.5rem;
-    color: #155724; /* Dark green text */
-    font-size: 1rem;
+    margin-bottom: 0.3rem;
+    color: #222;
+    font-size: 0.95rem;
   }
   .route-info p:last-child {
     margin-bottom: 0;
@@ -383,38 +466,52 @@ const cariDriver = async () => {
   /* Message display styling */
   .message {
     margin-top: 1rem;
-    padding: 10px;
-    border-radius: 8px;
-    background-color: #fff3cd; /* Light yellow for info/warning */
-    color: #856404; /* Dark yellow text */
-    border: 1px solid #ffeeba;
+    padding: 0.7rem 0.5rem;
+    border-radius: 4px;
+    background: #f1f3f4;
+    color: #444;
+    border: none;
     text-align: center;
-    font-weight: 500;
+    font-weight: 400;
+    font-size: 0.95rem;
+    box-shadow: none;
   }
   .message.error {
-    background-color: #f8d7da; /* Light red for errors */
-    color: #721c24; /* Dark red text */
-    border-color: #f5c6cb;
+    background: #fbeaea;
+    color: #c82333;
   }
   .message.success {
-    background-color: #d4edda; /* Light green for success */
-    color: #155724; /* Dark green text */
-    border-color: #c3e6cb;
+    background: #eafbe9;
+    color: #218838;
   }
   /* Responsive adjustments */
   @media (max-width: 600px) {
     .home-container {
-      padding: 0.5rem;
+      padding: 0;
+    }
+    .order-form {
+      padding: 1rem 0.5rem 0.5rem 0.5rem;
+      max-width: 98vw;
+      margin: 0 auto;
+      border-radius: 0 0 12px 12px;
     }
     .button-group {
-      flex-direction: column; /* Stack buttons vertically on small screens */
+      flex-direction: column;
     }
     .order-button, .cari-driver-button, .gunakan-lokasi-button {
-      width: 100%; /* Full width for stacked buttons */
-      flex: none; /* Remove flex sizing */
+      width: 100%;
+      min-width: 0;
+      max-width: 100%;
+      flex: none;
+      font-size: 0.98rem;
+      padding: 11px 0;
     }
     .suggestions {
-      width: calc(100% - 1rem); /* Adjust width for smaller padding */
+      width: 100%;
+    }
+    .route-info {
+      padding: 1rem 0.5rem;
+      font-size: 1rem;
     }
   }
 </style>
@@ -432,61 +529,71 @@ const cariDriver = async () => {
     <p>Memuat peta...</p>
   </div>
 
-  <div class="order-form" style="position: relative;">
-    <input
-      type="text"
-      placeholder="Lokasi Penjemputan"
-      bind:value={pickup}
-      on:input={(e) => fetchSuggestions(e.target.value, 'pickup')}
-      class="rounded-lg"
-    />
-    {#if suggestionsPickup.length}
-      <div class="suggestions rounded-lg">
-        {#each suggestionsPickup as item}
-          <div on:click={() => selectSuggestion(item, 'pickup')}>{item.display_name}</div>
-        {/each}
+  {#if !showRoutePanel}
+    <div class="order-form" style="position: relative;">
+      <div style="position:relative; display:flex; align-items:center;">
+        <input
+          type="text"
+          placeholder="Lokasi Penjemputan"
+          bind:value={pickup}
+          on:input={(e) => fetchSuggestions(e.target.value, 'pickup')}
+          class="rounded-lg"
+          style="flex:1; padding-right:2.2rem;"
+        />
+        <button
+          type="button"
+          on:click={gunakanLokasiSekarang}
+          class="gunakan-lokasi-button"
+          aria-label="Gunakan lokasi sekarang"
+          style="position:absolute; right:0.3rem; background:transparent; border:none; color:#007bff; font-size:1.3rem; padding:0; height:1.8rem; width:1.8rem; display:flex; align-items:center; justify-content:center; cursor:pointer;"
+        >
+          <span aria-hidden="true">📍</span>
+        </button>
+        {#if suggestionsPickup.length}
+          <div class="suggestions rounded-lg">
+            {#each suggestionsPickup as item}
+              <div on:click={() => selectSuggestion(item, 'pickup')}>{item.display_name}</div>
+            {/each}
+          </div>
+        {/if}
       </div>
-    {/if}
-
-    <button
-      type="button"
-      on:click={gunakanLokasiSekarang}
-      class="gunakan-lokasi-button rounded-lg"
-    >
-      📍 Gunakan Lokasi Sekarang
-    </button>
-
-    <input
-      type="text"
-      placeholder="Lokasi Tujuan"
-      bind:value={destination}
-      on:input={(e) => fetchSuggestions(e.target.value, 'destination')}
-      class="rounded-lg"
-    />
-    {#if suggestionsDestination.length}
-      <div class="suggestions rounded-lg">
-        {#each suggestionsDestination as item}
-          <div on:click={() => selectSuggestion(item, 'destination')}>{item.display_name}</div>
-        {/each}
+      <div style="position:relative;">
+        <input
+          type="text"
+          placeholder="Lokasi Tujuan"
+          bind:value={destination}
+          on:input={(e) => fetchSuggestions(e.target.value, 'destination')}
+          class="rounded-lg"
+        />
+        {#if suggestionsDestination.length}
+          <div class="suggestions rounded-lg">
+            {#each suggestionsDestination as item}
+              <div on:click={() => selectSuggestion(item, 'destination')}>{item.display_name}</div>
+            {/each}
+          </div>
+        {/if}
       </div>
-    {/if}
+      <button class="order-button rounded-lg" on:click={cariRute}>
+        Cari Rute & Estimasi
+      </button>
+    </div>
+  {/if}
 
-    <button class="order-button rounded-lg" on:click={cariRute}>
-      Cari Rute & Estimasi
-    </button>
-  </div>
-
-  {#if routeInfo}
-    <div class="route-info rounded-lg">
-      <p><strong>Jarak:</strong> {routeInfo.distance}</p>
-      <p><strong>Waktu Tempuh:</strong> {routeInfo.duration}</p>
-      <p><strong>Tarif:</strong> {routeInfo.tarif}</p>
-
+  {#if showRoutePanel && routeInfo}
+    <div class="route-info route-panel rounded-lg" style="position:relative; max-width:400px; margin:rem auto 0 auto;">
+      <button on:click={backToForm} aria-label="Kembali ke form" style="position:absolute; left:0.5rem; top:0.5rem; background:none; border:none; font-size:1.1rem; color:#007bff; cursor:pointer; padding:0.18rem 0.6rem 0.18rem 0.18rem; z-index:2; line-height:1;">
+        ←
+      </button>
+      <div style="text-align:center; padding-top:0.2rem; padding-left:2.2rem;">
+        <p style="margin-top:0.2rem;"><strong>Jarak:</strong> {routeInfo.distance}</p>
+        <p><strong>Waktu Tempuh:</strong> {routeInfo.duration}</p>
+        <p><strong>Tarif:</strong> {routeInfo.tarif}</p>
+      </div>
       <button
         class="cari-driver-button rounded-lg"
         on:click={cariDriver}
         disabled={isSearchingDriver}
-        style="margin-top: 1rem; width: 100%;"
+        style="margin-top: 1.2rem; width: 100%;"
       >
         {#if isSearchingDriver}
           Mencari driver...
